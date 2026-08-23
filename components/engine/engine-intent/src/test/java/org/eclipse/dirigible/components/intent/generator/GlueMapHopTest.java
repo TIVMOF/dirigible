@@ -319,6 +319,25 @@ class GlueMapHopTest {
         assertEquals("(Source == null ? null : Source.PlateNumber)", expressionFor(yaml, "PlateNumberChecked"));
     }
 
+    /**
+     * A hop on an APPENDING create-from. The cardinality decides whether the generated body keeps its
+     * at-most-once lookup, and the load is emitted right after that lookup - so the two features meet
+     * at the one place a template edit could drop the load. At the glue layer the cardinality changes
+     * nothing, which is the point worth pinning: the loads and the reads must be identical either way,
+     * leaving the template as the only thing that can differ (which {@code IntentEmissionCoverageIT}
+     * pins on the generated file).
+     */
+    @Test
+    void resolvesTheHopIdenticallyUnderTheAppendCardinality() {
+        String once = YAML.replace("    from: Fine", "    from: Fine\n    event: { onCreate: Fine }");
+        String append = once.replace("event: { onCreate: Fine }", "event: { onCreate: Fine, mode: append }");
+        assertEquals(expressionFor(once, "PlateNumberChecked"), expressionFor(append, "PlateNumberChecked"),
+                "the cardinality must not change how a hop is read");
+        assertEquals(1, loadsOf(append).size(), "an appending create-from declares the same single load, got: " + loadsOf(append));
+        assertEquals("vehicle", loadsOf(append).get(0)
+                                               .get("local"));
+    }
+
     private static void assertIssue(String yaml, String expected) {
         IntentValidationException ex = assertThrows(IntentValidationException.class, () -> IntentParser.parse(yaml));
         assertTrue(ex.getIssues()

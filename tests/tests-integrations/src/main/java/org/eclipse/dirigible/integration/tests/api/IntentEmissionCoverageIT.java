@@ -818,10 +818,17 @@ class IntentEmissionCoverageIT extends IntegrationTest {
                 fields:
                   - { name: id,   type: integer, primaryKey: true, generated: true }
                   - { name: note, type: string, length: 200 }
+                relations:
+                  # The relation the appending log rules hop THROUGH: a one-hop map source needs the
+                  # source to have a to-one, and this is the source of both of them.
+                  - { name: Zone, kind: manyToOne, to: Zone }
               - name: ShipmentLog
                 fields:
                   - { name: id,   type: integer, primaryKey: true, generated: true }
                   - { name: step, type: string, length: 100 }
+                  # The one-hop SNAPSHOT on an APPENDING create-from: the zone name as it stood when
+                  # each moment was recorded. Renaming the zone later must not rewrite these rows.
+                  - { name: zoneNameChecked, type: string, length: 100 }
                 relations:
                   - { name: Shipment, kind: manyToOne, to: Shipment }
               - name: ShipmentSummary
@@ -1221,6 +1228,10 @@ class IntentEmissionCoverageIT extends IntegrationTest {
                 event: { onStepReached: { process: ShipmentFlow, step: dispatch }, mode: append }
                 map:
                   Shipment: id
+                  # A hop under mode: append. The load is emitted OUTSIDE the at-most-once guard the
+                  # append cardinality removes entirely, so it has to survive that guard's absence -
+                  # and it runs per delivered event, once for each row appended.
+                  zoneNameChecked: Zone.name
                 defaults:
                   step: "dispatch"
               - name: log-settle
@@ -1230,6 +1241,7 @@ class IntentEmissionCoverageIT extends IntegrationTest {
                 button: true
                 map:
                   Shipment: id
+                  zoneNameChecked: Zone.name
                 defaults:
                   step: "settle"
               # the DEFAULT cardinality on the very same axis: one summary per shipment, and a click
@@ -2717,6 +2729,17 @@ class IntentEmissionCoverageIT extends IntegrationTest {
                 "mode: append must drop the existing-target lookup - every event appends a row");
         assertTrue(logSettleGenerate.contains("target.Step = \"settle\";"),
                 "the appended row must still be built by the whole create-from (map + defaults)");
+        // A one-hop map source on an APPENDING create-from. The load is emitted after the at-most-once
+        // guard, and append removes that guard entirely - so the two features meet at exactly the place
+        // a template edit could drop the load. Pinned on both files: the two rules hop independently.
+        assertTrue(
+                logSettleGenerate.contains("Repository().findById(source.Zone)")
+                        && logSettleGenerate.contains("target.ZoneNameChecked = (Zone == null ? null : Zone.Name);"),
+                "an appending create-from must still load and read its one-hop map source");
+        assertTrue(
+                contentOf("gen/events/emission/LogDispatchGenerate.java").contains(
+                        "target.ZoneNameChecked = (Zone == null ? null : Zone.Name);"),
+                "the second appending rule must resolve its hop independently of the first");
         assertTrue(contentOf("gen/events/emission/SummaryFromShipmentGenerate.java").contains(".eq(\"Shipment\", sourceId)"),
                 "the default cardinality must keep the at-most-once lookup");
         assertTrue(contentOf("gen/events/emission/ShipmentFlowSettleCompleted.java").contains("implements JavaDelegate"),
@@ -4044,7 +4067,7 @@ class IntentEmissionCoverageIT extends IntegrationTest {
     private void assertGeneratesStepAxisRuntime() {
         AtomicInteger shipmentId = new AtomicInteger();
         restAssuredExecutor.execute(() -> shipmentId.set(given().contentType("application/json")
-                                                                .body("{\"Note\":\"crate 7\"}")
+                                                                .body("{\"Note\":\"crate 7\",\"Zone\":1}")
                                                                 .when()
                                                                 .post(API + "/shipment/ShipmentController")
                                                                 .then()
@@ -4072,6 +4095,15 @@ class IntentEmissionCoverageIT extends IntegrationTest {
                                                             .sorted()
                                                             .toList(),
                     "the appended rows must record which moment each of them is about");
+            // The one-hop map source under mode: append. The load is emitted outside the at-most-once
+            // guard - which append removes entirely - so this is the case that proves it does not
+            // depend on that guard being there. EVERY appended row carries it: the hop runs per
+            // delivered event, not once per source.
+            assertEquals(List.of("North", "North"), logs.getList(rows + ".ZoneNameChecked")
+                                                        .stream()
+                                                        .map(String::valueOf)
+                                                        .toList(),
+                    "each appended row must snapshot the zone name through the source's relation");
         }, 60);
 
         // The at-most-once sibling on the same moment: exactly one summary.
@@ -4108,6 +4140,23 @@ class IntentEmissionCoverageIT extends IntegrationTest {
                                    .getList(rows)
                                    .size(),
                     "append carries no guard at all - a click after the events appends another row");
+        });
+        // ...and that row snapshots the zone too. Worth its own assertion: the click enters through the
+        // ENDPOINT while the two before it came from the step listener, and the hop lives in the
+        // create() body both of them share - so this is what proves the two triggers cannot drift.
+        restAssuredExecutor.execute(() -> {
+            String rows = "findAll { it.Shipment == " + shipmentId.get() + " }";
+            assertEquals(List.of("North", "North", "North"), given().when()
+                                                                    .get(API + "/shipmentlog/ShipmentLogController")
+                                                                    .then()
+                                                                    .statusCode(200)
+                                                                    .extract()
+                                                                    .jsonPath()
+                                                                    .getList(rows + ".ZoneNameChecked")
+                                                                    .stream()
+                                                                    .map(String::valueOf)
+                                                                    .toList(),
+                    "the clicked append must resolve the hop exactly as the event-driven ones did");
         });
 
         // ...while the same click on the at-most-once sibling hands back the summary that exists.
